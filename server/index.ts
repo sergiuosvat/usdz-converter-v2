@@ -1,7 +1,7 @@
 // server/index.ts
 import { Storage } from "@google-cloud/storage";
 import { createWriteStream } from "fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { parse } from "path";
 import winston from "winston";
 
@@ -84,6 +84,7 @@ Bun.serve({
     if (pathname === "/healthz") return new Response("ok");
 
     if (pathname === "/api/convert") {
+      let dir: string | null = null;
       try {
         const formdata = await req.formData();
         const filenameField = formdata.get("filename") as unknown as string;
@@ -96,30 +97,51 @@ Bun.serve({
           return Response.json({ message: "GCS is not configured on this server" }, { status: 500 });
         }
 
-  // normalize to always look under the 'models/' prefix in the bucket
-  const originalName = filenameField.startsWith("models/") ? filenameField : `models/${filenameField}`;
+        // normalize to always look under the 'models/' prefix in the bucket
+        const originalName = filenameField.startsWith("models/") ? filenameField : `models/${filenameField}`;
         const id = crypto.randomUUID();
-        const dir = `${FILES_FOLDER}/${id}`;
+        dir = `${FILES_FOLDER}/${id}`;
         await mkdir(dir, { recursive: true });
 
-        const destPath = `${dir}/${originalName}`;
+        // preserve the object's directory structure locally
+        const parsed = parse(originalName); // { dir, base, name, ext }
+        const objectDir = parsed.dir || ""; // e.g. 'models/some/path'
+        const objectBase = parsed.base; // filename with ext
+        const objectNameNoExt = parsed.name;
+        const objectExt = parsed.ext;
+
+        const localObjectDir = `${dir}/${objectDir}`;
+        await mkdir(localObjectDir, { recursive: true });
+
+        const destPath = `${localObjectDir}/${objectBase}`;
         logger.info(`Downloading ${originalName} from GCS bucket ${GCS_BUCKET} to ${destPath}`);
         await downloadFromGCS(GCS_BUCKET, originalName, destPath);
 
         logger.info(`Converting file ${originalName}...`);
         const inputPath = destPath;
+        const convertedName = `${objectNameNoExt}.usdz`;
         const name = convertFile(inputPath);
 
-        const outputPath = `${dir}/${name}`;
-  const destObjectName = `models/${id}/${name}`; // store under models/<id>/<name> to avoid collisions
+        // upload the converted file back to the same object directory in GCS
+        const outputPath = `${localObjectDir}/${convertedName}`;
+        const destObjectName = `${objectDir}/${convertedName}`; // same directory as original
         logger.info(`Uploading converted file ${outputPath} to GCS bucket ${GCS_BUCKET} as ${destObjectName}`);
         await uploadToGCS(GCS_BUCKET, outputPath, destObjectName);
         const uploadedUrl = await getSignedUrl(GCS_BUCKET, destObjectName);
 
-        return Response.json({ id, name, uploadedUrl });
+        return Response.json({ id, name, uploadedUrl, objectPath: destObjectName });
       } catch (err) {
         logger.error(String(err));
         return Response.json({ message: String(err) }, { status: 500 });
+      } finally {
+        if (dir) {
+          try {
+            await rm(dir, { recursive: true, force: true });
+            logger.info(`Cleaned up temporary directory ${dir}`);
+          } catch (cleanupErr) {
+            logger.warn(`Failed to remove temp directory ${dir}: ${String(cleanupErr)}`);
+          }
+        }
       }
     }
 
