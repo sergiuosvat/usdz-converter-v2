@@ -1,10 +1,7 @@
+import { mkdir } from "node:fs/promises";
 import { parse } from "path";
-import { CronJob } from "cron";
 import winston from "winston";
-import { readdir, rm, mkdir } from "node:fs/promises";
 
-// 30 minutes
-const EXPIRATION_TIME = 30 * 60 * 1000;
 const FILES_FOLDER = "/usr/app/gltf2usdz/files";
 const LOGS_FOLDER = "/usr/app/gltf2usdz/logs";
 const FRONTEND_FOLDER = "../client/dist";
@@ -29,11 +26,10 @@ const logger = winston.createLogger({
   ],
 });
 
-const job = new CronJob("* * * * *", deleteExpiredFiles);
 
-job.start();
 
 mkdir(FILES_FOLDER, { recursive: true });
+
 
 Bun.serve({
   port: 4000,
@@ -56,16 +52,14 @@ Bun.serve({
           throw new Error("You must upload a glb/gltf file.");
         }
 
-        const expires = Date.now() + EXPIRATION_TIME;
-        const id = `${expires}_${crypto.randomUUID()}`;
-
+        const id = crypto.randomUUID();
         const filename = `${FILES_FOLDER}/${id}/${file.name}`;
 
         await Bun.write(filename, file);
 
         const name = convertFile(filename);
 
-        return Response.json({ id, expires, name });
+        return Response.json({ id, name });
       } catch (error) {
         logger.error(error);
         return Response.json({ message: String(error) }, { status: 500 });
@@ -89,7 +83,7 @@ Bun.serve({
         return new Response(file);
       } catch (error) {
         const message =
-          "Failed to download the file. Your file maybe is expired.";
+          "Failed to download the file.";
         logger.error(message);
         return Response.json({ message }, { status: 500 });
       }
@@ -138,18 +132,4 @@ function convertFile(filepath: string) {
   return `${name}.usdz`;
 }
 
-async function deleteExpiredFiles() {
-  logger.info("Cleaning expired files");
-  const files = await readdir(FILES_FOLDER);
-  const now = Date.now();
 
-  for (const file of files) {
-    const timestamp = Number(file.substring(0, file.indexOf("_")));
-
-    if (now > timestamp) {
-      rm(`${FILES_FOLDER}/${file}`, { recursive: true });
-      logger.info(`Deleting ${FILES_FOLDER}/${file}`);
-    }
-  }
-  logger.info("Ended cleaning expired files");
-}

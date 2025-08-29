@@ -1,0 +1,14 @@
+node_modules
+client/node_modules
+server/node_modules
+*.log
+dist
+build
+.env
+.git
+.gitignore
+.vscode
+Dockerfile
+docker-compose.yml
+*.md
+bun.lockb
