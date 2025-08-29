@@ -1,4 +1,3 @@
-// server/index.ts
 import { Storage } from "@google-cloud/storage";
 import { createWriteStream } from "fs";
 import { mkdir, rm } from "node:fs/promises";
@@ -6,7 +5,8 @@ import { parse } from "path";
 import winston from "winston";
 
 const FILES_FOLDER = process.env.FILES_FOLDER || "/tmp/gltf2usdz/files";
-const LOGS_FOLDER  = process.env.LOGS_FOLDER  || "/tmp/gltf2usdz/logs";
+const LOGS_FOLDER = process.env.LOGS_FOLDER || "/tmp/gltf2usdz/logs";
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
 const logger = winston.createLogger({
   level: "info",
@@ -16,7 +16,6 @@ const logger = winston.createLogger({
   ),
   transports: [
     new winston.transports.Console(),
-    // File transport now points to /tmp
     new winston.transports.File({
       maxsize: 20_000_000,
       maxFiles: 5,
@@ -27,7 +26,7 @@ const logger = winston.createLogger({
 });
 
 await mkdir(FILES_FOLDER, { recursive: true });
-await mkdir(LOGS_FOLDER,  { recursive: true });
+await mkdir(LOGS_FOLDER, { recursive: true });
 
 // Initialize GCS client if credentials and bucket are provided through env
 const GCS_BUCKET = Bun.env.GCS_BUCKET || process.env.GCS_BUCKET;
@@ -43,6 +42,14 @@ if (GCS_BUCKET) {
 } else {
   logger.info("No GCS_BUCKET configured; GCS features disabled");
 }
+
+// CORS headers helper
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Accept",
+  "Access-Control-Max-Age": "600",
+};
 
 async function downloadFromGCS(bucketName: string, objectName: string, destPath: string) {
   if (!storage) throw new Error("GCS client not initialized");
@@ -81,20 +88,46 @@ Bun.serve({
   async fetch(req) {
     const { pathname } = new URL(req.url);
 
-    if (pathname === "/healthz") return new Response("ok");
+    // Basic request logging for diagnostics
+    try {
+      logger.info(`[req] ${req.method} ${pathname}`);
+      logger.info(`  content-type: ${req.headers.get("content-type")}`);
+      logger.info(`  content-length: ${req.headers.get("content-length")}`);
+      // log headers but skip auth-sensitive ones
+      for (const [k, v] of req.headers) {
+        if (k.toLowerCase() === "authorization") continue;
+        logger.debug(`  hdr: ${k}: ${v}`);
+      }
+    } catch (e) {
+      // ignore logging errors
+    }
+
+    // Handle CORS preflight quickly
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    if (pathname === "/healthz") {
+      return new Response("ok", { status: 200, headers: CORS_HEADERS });
+    }
 
     if (pathname === "/api/convert") {
       let dir: string | null = null;
       try {
+        // Validate method
+        if (req.method !== "POST") {
+          return Response.json({ message: "Method not allowed" }, { status: 405, headers: CORS_HEADERS });
+        }
+
         const formdata = await req.formData();
         const filenameField = formdata.get("filename") as unknown as string;
 
         if (!filenameField || typeof filenameField !== "string") {
-          return Response.json({ message: "You must provide a 'filename' form field pointing to the object in GCS" }, { status: 400 });
+          return Response.json({ message: "You must provide a 'filename' form field pointing to the object in GCS" }, { status: 400, headers: CORS_HEADERS });
         }
 
         if (!storage || !GCS_BUCKET) {
-          return Response.json({ message: "GCS is not configured on this server" }, { status: 500 });
+          return Response.json({ message: "GCS is not configured on this server" }, { status: 500, headers: CORS_HEADERS });
         }
 
         // normalize to always look under the 'models/' prefix in the bucket
@@ -129,10 +162,10 @@ Bun.serve({
         await uploadToGCS(GCS_BUCKET, outputPath, destObjectName);
         const uploadedUrl = await getSignedUrl(GCS_BUCKET, destObjectName);
 
-        return Response.json({ id, name, uploadedUrl, objectPath: destObjectName });
+        return Response.json({ id, name, uploadedUrl, objectPath: destObjectName }, { status: 200, headers: CORS_HEADERS });
       } catch (err) {
         logger.error(String(err));
-        return Response.json({ message: String(err) }, { status: 500 });
+        return Response.json({ message: String(err) }, { status: 500, headers: CORS_HEADERS });
       } finally {
         if (dir) {
           try {
@@ -145,7 +178,7 @@ Bun.serve({
       }
     }
 
-    return new Response("Not Found", { status: 404 });
+    return new Response("Not Found", { status: 404, headers: CORS_HEADERS });
   },
 });
 
