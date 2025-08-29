@@ -20,14 +20,14 @@ ENV PATH=$BUN_INSTALL/bin:$PATH
 
 COPY . .
 
-EXPOSE 4000
+# runtime envs
+ENV PORT=8080
+ENV FILES_FOLDER=/tmp/gltf2usdz/files
+ENV LOGS_FOLDER=/tmp/gltf2usdz/logs
+EXPOSE 8080
 
-RUN bun install
-
-WORKDIR ${APP_DIR}/client
-
-RUN bun run build
-
+# install dependencies in server folder only
 WORKDIR ${APP_DIR}/server
+RUN bun install
 
 ENTRYPOINT ["bun", "run", "start"]

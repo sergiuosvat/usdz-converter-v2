@@ -1,23 +1,23 @@
+// server/index.ts
+import { Storage } from "@google-cloud/storage";
+import { createWriteStream } from "fs";
 import { mkdir } from "node:fs/promises";
 import { parse } from "path";
 import winston from "winston";
 
-const FILES_FOLDER = "/usr/app/gltf2usdz/files";
-const LOGS_FOLDER = "/usr/app/gltf2usdz/logs";
-const FRONTEND_FOLDER = "../client/dist";
+const FILES_FOLDER = process.env.FILES_FOLDER || "/tmp/gltf2usdz/files";
+const LOGS_FOLDER  = process.env.LOGS_FOLDER  || "/tmp/gltf2usdz/logs";
 
 const logger = winston.createLogger({
   level: "info",
   format: winston.format.combine(
     winston.format.timestamp(),
-    winston.format.printf(
-      (info) => `[${info.timestamp}] ${info.level}: ${info.message}`,
-    ),
+    winston.format.printf((info) => `[${info.timestamp}] ${info.level}: ${info.message}`),
   ),
   transports: [
     new winston.transports.Console(),
+    // File transport now points to /tmp
     new winston.transports.File({
-      // 20 megabytes
       maxsize: 20_000_000,
       maxFiles: 5,
       filename: `${LOGS_FOLDER}/app.log`,
@@ -26,101 +26,116 @@ const logger = winston.createLogger({
   ],
 });
 
+await mkdir(FILES_FOLDER, { recursive: true });
+await mkdir(LOGS_FOLDER,  { recursive: true });
 
+// Initialize GCS client if credentials and bucket are provided through env
+const GCS_BUCKET = Bun.env.GCS_BUCKET || process.env.GCS_BUCKET;
+let storage: Storage | null = null;
+if (GCS_BUCKET) {
+  try {
+    storage = new Storage();
+    logger.info(`Google Cloud Storage client initialized for bucket ${GCS_BUCKET}`);
+  } catch (err) {
+    logger.warn(`Failed to initialize Google Cloud Storage client: ${String(err)}`);
+    storage = null;
+  }
+} else {
+  logger.info("No GCS_BUCKET configured; GCS features disabled");
+}
 
-mkdir(FILES_FOLDER, { recursive: true });
+async function downloadFromGCS(bucketName: string, objectName: string, destPath: string) {
+  if (!storage) throw new Error("GCS client not initialized");
+  const bucket = storage.bucket(bucketName);
+  const file = bucket.file(objectName);
 
+  return new Promise<void>((resolve, reject: (err: Error) => void) => {
+    const destStream = createWriteStream(destPath);
+    file.createReadStream()
+      .on("error", (err: Error) => reject(err))
+      .on("end", () => resolve())
+      .pipe(destStream);
+  });
+}
+
+async function uploadToGCS(bucketName: string, localPath: string, destObjectName: string) {
+  if (!storage) throw new Error("GCS client not initialized");
+  const bucket = storage.bucket(bucketName);
+  await bucket.upload(localPath, { destination: destObjectName });
+}
+
+async function getSignedUrl(bucketName: string, objectName: string) {
+  if (!storage) throw new Error("GCS client not initialized");
+  const bucket = storage.bucket(bucketName);
+  const file = bucket.file(objectName);
+  const [url] = await file.getSignedUrl({ action: "read", expires: Date.now() + 60 * 60 * 1000 }); // 1 hour
+  return url;
+}
+
+const PORT = Number(Bun.env.PORT || 8080);
 
 Bun.serve({
-  port: 4000,
-  maxRequestBodySize: 1024 * 1024 * 50, // 50MB
+  hostname: "0.0.0.0",
+  port: PORT,
+  maxRequestBodySize: 50 * 1024 * 1024,
   async fetch(req) {
-    const { pathname, searchParams } = new URL(req.url);
+    const { pathname } = new URL(req.url);
+
+    if (pathname === "/healthz") return new Response("ok");
 
     if (pathname === "/api/convert") {
       try {
         const formdata = await req.formData();
-        const file = formdata.get("file") as unknown as File;
+        const filenameField = formdata.get("filename") as unknown as string;
 
-        logger.info(`Converting file ${file.name}...`);
-
-        if (
-          !file ||
-          !(file instanceof File) ||
-          !(file.name.endsWith(".gltf") || file.name.endsWith(".glb"))
-        ) {
-          throw new Error("You must upload a glb/gltf file.");
+        if (!filenameField || typeof filenameField !== "string") {
+          return Response.json({ message: "You must provide a 'filename' form field pointing to the object in GCS" }, { status: 400 });
         }
 
+        if (!storage || !GCS_BUCKET) {
+          return Response.json({ message: "GCS is not configured on this server" }, { status: 500 });
+        }
+
+  // normalize to always look under the 'models/' prefix in the bucket
+  const originalName = filenameField.startsWith("models/") ? filenameField : `models/${filenameField}`;
         const id = crypto.randomUUID();
-        const filename = `${FILES_FOLDER}/${id}/${file.name}`;
+        const dir = `${FILES_FOLDER}/${id}`;
+        await mkdir(dir, { recursive: true });
 
-        await Bun.write(filename, file);
+        const destPath = `${dir}/${originalName}`;
+        logger.info(`Downloading ${originalName} from GCS bucket ${GCS_BUCKET} to ${destPath}`);
+        await downloadFromGCS(GCS_BUCKET, originalName, destPath);
 
-        const name = convertFile(filename);
+        logger.info(`Converting file ${originalName}...`);
+        const inputPath = destPath;
+        const name = convertFile(inputPath);
 
-        return Response.json({ id, name });
-      } catch (error) {
-        logger.error(error);
-        return Response.json({ message: String(error) }, { status: 500 });
+        const outputPath = `${dir}/${name}`;
+  const destObjectName = `models/${id}/${name}`; // store under models/<id>/<name> to avoid collisions
+        logger.info(`Uploading converted file ${outputPath} to GCS bucket ${GCS_BUCKET} as ${destObjectName}`);
+        await uploadToGCS(GCS_BUCKET, outputPath, destObjectName);
+        const uploadedUrl = await getSignedUrl(GCS_BUCKET, destObjectName);
+
+        return Response.json({ id, name, uploadedUrl });
+      } catch (err) {
+        logger.error(String(err));
+        return Response.json({ message: String(err) }, { status: 500 });
       }
     }
 
-    if (pathname === "/api/download") {
-      try {
-        if (!searchParams.has("id") || !searchParams.has("name")) {
-          return new Response("Bad request", { status: 400 });
-        }
-
-        const file = Bun.file(
-          `${FILES_FOLDER}/${searchParams.get("id")}/${searchParams.get("name")}`,
-        );
-
-        if (!(await file.exists())) {
-          throw new Error();
-        }
-
-        return new Response(file);
-      } catch (error) {
-        const message =
-          "Failed to download the file.";
-        logger.error(message);
-        return Response.json({ message }, { status: 500 });
-      }
-    }
-
-    if (pathname === "/") {
-      return new Response(Bun.file(`${FRONTEND_FOLDER}/index.html`));
-    }
-
-    try {
-      const file = Bun.file(FRONTEND_FOLDER + pathname);
-
-      if (!(await file.exists())) {
-        throw new Error();
-      }
-
-      return new Response(file);
-    } catch (error) {
-      return new Response("Not Found", { status: 404 });
-    }
+    return new Response("Not Found", { status: 404 });
   },
 });
 
-logger.info("gltf2usdz is running on port 4000");
+logger.info(`gltf2usdz is running on port ${PORT}`);
 
 function convertFile(filepath: string) {
   const { ext, name } = parse(filepath);
-
   const output = filepath.replace(ext, ".usdz");
 
   const { stderr } = Bun.spawnSync([`usd_from_gltf`, filepath, output]);
-
   const stderrString = stderr.toString();
-  
-  if (stderrString) {
-    logger.warn(stderrString);
-  }
+  if (stderrString) logger.warn(stderrString);
 
   const outputFile = Bun.file(output);
   if (!outputFile.exists()) {
@@ -128,8 +143,5 @@ function convertFile(filepath: string) {
   }
 
   logger.info("File converted successfully");
-
   return `${name}.usdz`;
 }
-
-

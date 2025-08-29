@@ -2,7 +2,6 @@
   "name": "gltf2usdz.online",
   "private": true,
   "workspaces": [
-    "client",
     "server"
   ]
 }
