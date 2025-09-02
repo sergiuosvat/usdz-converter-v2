@@ -1,10 +1,12 @@
 import { Storage } from "@google-cloud/storage";
-import { createWriteStream } from "fs";
+import { createWriteStream, existsSync } from "fs";
 import { mkdir, rm } from "node:fs/promises";
+import os from "os";
 import { parse } from "path";
 import winston from "winston";
 
-const FILES_FOLDER = process.env.FILES_FOLDER || "/tmp/gltf2usdz/files";
+// Prefer in-memory tmpfs when available to speed I/O for temporary files
+const FILES_FOLDER = process.env.FILES_FOLDER || (process.platform !== "win32" && existsSync("/dev/shm") ? "/dev/shm/gltf2usdz/files" : "/tmp/gltf2usdz/files");
 const LOGS_FOLDER = process.env.LOGS_FOLDER || "/tmp/gltf2usdz/logs";
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
@@ -27,6 +29,36 @@ const logger = winston.createLogger({
 
 await mkdir(FILES_FOLDER, { recursive: true });
 await mkdir(LOGS_FOLDER, { recursive: true });
+
+// Simple semaphore to limit concurrent conversions (default = number of CPUs)
+class Semaphore {
+  max: number;
+  current: number;
+  queue: Array<() => void>;
+  constructor(max: number) {
+    this.max = Math.max(1, max);
+    this.current = 0;
+    this.queue = [];
+  }
+  async acquire() {
+    if (this.current < this.max) {
+      this.current++;
+      return;
+    }
+    await new Promise<void>((resolve) => this.queue.push(resolve));
+    this.current++;
+  }
+  release() {
+    this.current = Math.max(0, this.current - 1);
+    if (this.queue.length > 0) {
+      const next = this.queue.shift();
+      if (next) next();
+    }
+  }
+}
+
+const DEFAULT_CONCURRENCY = Number(process.env.CONCURRENCY || String(Math.max(1, os.cpus()?.length || 1)));
+const semaphore = new Semaphore(DEFAULT_CONCURRENCY);
 
 // Initialize GCS client if bucket is provided. Prefer in-memory service key via
 // the GCP_SERVICE_KEY env var (so we don't need to write a JSON file to disk).
@@ -167,7 +199,13 @@ Bun.serve({
         logger.info(`Converting file ${originalName}...`);
         const inputPath = destPath;
         const convertedName = `${objectNameNoExt}.usdz`;
-        const name = convertFile(inputPath);
+        await semaphore.acquire();
+        let name: string;
+        try {
+          name = await convertFile(inputPath);
+        } finally {
+          semaphore.release();
+        }
 
         // upload the converted file back to the same object directory in GCS
         const outputPath = `${localObjectDir}/${convertedName}`;
@@ -198,12 +236,19 @@ Bun.serve({
 
 logger.info(`gltf2usdz is running on port ${PORT}`);
 
-function convertFile(filepath: string) {
+async function convertFile(filepath: string) {
   const { ext, name } = parse(filepath);
   const output = filepath.replace(ext, ".usdz");
 
-  const { stderr } = Bun.spawnSync([`usd_from_gltf`, filepath, output]);
-  const stderrString = stderr.toString();
+  const child = Bun.spawn([`usd_from_gltf`, filepath, output], { stdout: "pipe", stderr: "pipe" });
+  await child.exited;
+  let stderrString = "";
+  try {
+    stderrString = (await child.stderr.text()) ?? "";
+  } catch (e) {
+    // ignore if stderr not available
+    stderrString = "";
+  }
   if (stderrString) logger.warn(stderrString);
 
   const outputFile = Bun.file(output);
