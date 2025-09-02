@@ -28,13 +28,27 @@ const logger = winston.createLogger({
 await mkdir(FILES_FOLDER, { recursive: true });
 await mkdir(LOGS_FOLDER, { recursive: true });
 
-// Initialize GCS client if credentials and bucket are provided through env
+// Initialize GCS client if bucket is provided. Prefer in-memory service key via
+// the GCP_SERVICE_KEY env var (so we don't need to write a JSON file to disk).
 const GCS_BUCKET = Bun.env.GCS_BUCKET || process.env.GCS_BUCKET;
+const GCP_SERVICE_KEY = Bun.env.GCP_SERVICE_KEY || process.env.GCP_SERVICE_KEY;
 let storage: Storage | null = null;
 if (GCS_BUCKET) {
   try {
-    storage = new Storage();
-    logger.info(`Google Cloud Storage client initialized for bucket ${GCS_BUCKET}`);
+    if (GCP_SERVICE_KEY) {
+      let creds: any;
+      try {
+        creds = JSON.parse(GCP_SERVICE_KEY);
+      } catch (parseErr) {
+        throw new Error("GCP_SERVICE_KEY is not valid JSON");
+      }
+      storage = new Storage({ credentials: creds });
+      logger.info(`Google Cloud Storage client initialized for bucket ${GCS_BUCKET} using in-memory service key`);
+    } else {
+      // Fallback to Application Default Credentials (useful when running on GCP)
+      storage = new Storage();
+      logger.info(`Google Cloud Storage client initialized for bucket ${GCS_BUCKET} using ADC`);
+    }
   } catch (err) {
     logger.warn(`Failed to initialize Google Cloud Storage client: ${String(err)}`);
     storage = null;
